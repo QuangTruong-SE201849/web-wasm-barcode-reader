@@ -185,6 +185,11 @@ export class BarcodeScanner {
   /** Thời gian quét mã vạch gần nhất dùng cho throttling. */
   private lastScannedTime = 0;
 
+  // Thuộc tính theo dõi trạng thái crop ngang tạm thời để điều hướng tọa độ polygon vẽ khung đỏ
+  private currentCropFactor = 1.0;
+  private currentCropX = 0;
+
+
   get isRunning(): boolean {
     return this._isRunning;
   }
@@ -525,13 +530,21 @@ export class BarcodeScanner {
         rotatedPoly.push(rx, ry);
       }
 
-      // Convert polygon from offscreen-canvas coords to container coords
+      // Convert polygon from offscreen-canvas coords (taking crop into account) to container coords
       const sp = this.scratchPoly;
       sp.length = rotatedPoly.length;
+      const cropX = this.currentCropX;
+      const cropF = this.currentCropFactor;
+      
       for (let i = 0; i < rotatedPoly.length; i += 2) {
-        sp[i] = rotatedPoly[i] * this.polyScaleX + this.barcodeOffsetX;
-        sp[i + 1] = rotatedPoly[i + 1] * this.polyScaleY + this.barcodeOffsetY;
+        // Ánh xạ ngược từ canvas bị co giãn (crop) về canvas gốc
+        const origCanvasX = cropX + rotatedPoly[i] * cropF;
+        const origCanvasY = rotatedPoly[i + 1]; // Không crop dọc nên Y giữ nguyên
+        
+        sp[i] = origCanvasX * this.polyScaleX + this.barcodeOffsetX;
+        sp[i + 1] = origCanvasY * this.polyScaleY + this.barcodeOffsetY;
       }
+
 
       // Draw detection polygon on the overlay canvas
       this.drawPoly(sp);
@@ -582,13 +595,11 @@ export class BarcodeScanner {
     const videoH = this.video.videoHeight;
     if (videoW === 0 || videoH === 0) return;
 
-    const scaleX = videoW / this.cameraWidth;
-    const scaleY = videoH / this.cameraHeight;
+    const containerW = this.cameraWidth;
+    const containerH = this.cameraHeight;
 
-    const srcX = this.barcodeOffsetX * scaleX;
-    const srcY = this.barcodeOffsetY * scaleY;
-    const srcW = this.barcodeWidth * scaleX;
-    const srcH = this.barcodeHeight * scaleY;
+    // Phát hiện nếu luồng video bị xoay (ví dụ: video ngang 1280x720 hiển thị dọc 390x600 trên mobile Safari)
+    const isRotated = videoW > videoH && containerW < containerH;
 
     if (this.hadDetectionLastTick) {
       this.polyCtx.clearRect(0, 0, this.cameraWidth, this.cameraHeight);
@@ -602,65 +613,98 @@ export class BarcodeScanner {
     }
 
     let imageData: ImageData | null = null;
+    let fullImageData: ImageData | null = null;
 
     try {
-      // 1. Chỉ vẽ video chưa xoay lên offscreen canvas đúng 1 lần duy nhất
-      this.offCtx.drawImage(
-        this.video,
-        srcX, srcY, srcW, srcH,
-        0, 0, w, h,
-      );
+      // 1. Quét Full Frame
+      // Vẽ video camera lên canvas phụ (áp dụng xoay nếu luồng camera bị xoay 90 độ)
+      if (isRotated) {
+        this.offCtx.save();
+        this.offCtx.translate(w / 2, h / 2);
+        this.offCtx.rotate(Math.PI / 2); // Xoay 90 độ theo chiều kim đồng hồ
+        
+        // Tính toán tỉ lệ cover dựa trên kích thước thực tế sau khi xoay (videoH là chiều ngang mới, videoW là chiều dọc mới)
+        const scale = Math.max(containerW / videoH, containerH / videoW);
+        const drawW = videoW * scale;
+        const drawH = videoH * scale;
+        
+        // Tính độ dời của vùng barcode so với tâm container
+        const dx = (this.barcodeOffsetX + this.barcodeWidth / 2) - (containerW / 2);
+        const dy = (this.barcodeOffsetY + this.barcodeHeight / 2) - (containerH / 2);
+        
+        // Trong hệ tọa độ xoay 90 độ: độ lệch dx (ngang) map vào Y mới, dy (dọc) map vào -X mới
+        this.offCtx.translate(-dy * scale, dx * scale);
+        this.offCtx.drawImage(this.video, 0, 0, videoW, videoH, -drawW / 2, -drawH / 2, drawW, drawH);
+        this.offCtx.restore();
+      } else {
+        this.offCtx.save();
+        const scale = Math.max(containerW / videoW, containerH / videoH);
+        const drawW = videoW * scale;
+        const drawH = videoH * scale;
+        
+        const dx = (this.barcodeOffsetX + this.barcodeWidth / 2) - (containerW / 2);
+        const dy = (this.barcodeOffsetY + this.barcodeHeight / 2) - (containerH / 2);
+        
+        this.offCtx.translate(w / 2 - dx * scale, h / 2 - dy * scale);
+        this.offCtx.drawImage(this.video, 0, 0, videoW, videoH, -drawW / 2, -drawH / 2, drawW, drawH);
+        this.offCtx.restore();
+      }
 
-      // 2. Chỉ gọi getImageData 1 lần duy nhất để lấy pixel thô, tránh rác RAM
-      imageData = this.offCtx.getImageData(0, 0, w, h);
+      fullImageData = this.offCtx.getImageData(0, 0, w, h);
+      imageData = fullImageData;
 
-      // 3. Thực hiện vòng lặp thử 3 góc xoay
+      // Đặt mặc định trạng thái không crop để setupResultHandler hoạt động bình thường
+      this.currentCropFactor = 1.0;
+      this.currentCropX = 0;
+
       for (let ai = 0; ai < ROTATION_ANGLES.length; ai++) {
         const angle = ROTATION_ANGLES[ai];
         this.detectedThisTick = false;
         this.currentScanAngle = angle;
 
-        // Xoay byte pixel và copy trực tiếp vào bộ nhớ WASM heap (RAM cấp phát thêm = 0)
         rotateAndCopy(imageData.data, w, h, angle, Module.HEAPU8, this.wasmBufferPtr);
-
-        // Vẽ dòng preview đã xoay tương ứng (nếu có previewCanvas debug)
-        if (this.previewCtx) {
-          const rowY = ai * h;
-          this.previewCtx.save();
-          this.previewCtx.translate(w / 2, rowY + h / 2);
-          this.previewCtx.rotate(angle);
-          this.previewCtx.translate(-w / 2, -(rowY + h / 2));
-          this.previewCtx.drawImage(this.offscreen, 0, 0, w, h, 0, rowY, w, h);
-          this.previewCtx.restore();
-        }
-
-        // Chạy giải mã ZBar WASM
         this.wasmApi.scan_image_rgba(this.wasmBufferPtr, w, h);
-
-        if (this.previewCtx) {
-          const rowY = ai * h;
-          const deg = Math.round(angle * 180 / Math.PI);
-          const label = `${deg >= 0 ? '+' : ''}${deg}°`;
-
-          if (this.detectedThisTick) {
-            this.previewCtx.strokeStyle = '#00ff88';
-            this.previewCtx.lineWidth = 3;
-            this.previewCtx.strokeRect(1, rowY + 1, w - 2, h - 2);
-          }
-
-          this.previewCtx.font = 'bold 16px monospace';
-          this.previewCtx.fillStyle = this.detectedThisTick ? '#00ff88' : 'rgba(255,255,255,0.7)';
-          this.previewCtx.fillText(label, 8, rowY + 22);
-        }
-
         if (this.detectedThisTick) break;
       }
+
+      // 2. Nếu quét Full không ra, thử các mức crop ngang tịnh tiến (90%, 80%, 70%) ở góc 0°
+      // để tự động cắt bỏ viền đen bao quanh barcode (giải quyết lỗi Quiet Zone)
+      if (!this.detectedThisTick) {
+        const CROP_LEVELS = [0.90, 0.80, 0.70];
+        for (const crop of CROP_LEVELS) {
+          const cropW = w * crop;
+          const cropX = (w - cropW) / 2;
+
+          this.currentCropFactor = crop;
+          this.currentCropX = cropX;
+
+          // Khôi phục canvas gốc và crop trên canvas
+          this.offCtx.putImageData(fullImageData, 0, 0);
+          this.offCtx.drawImage(
+            this.offscreen,
+            cropX, 0, cropW, h,
+            0, 0, w, h,
+          );
+          
+          imageData = this.offCtx.getImageData(0, 0, w, h);
+          this.currentScanAngle = 0;
+
+          rotateAndCopy(imageData.data, w, h, 0, Module.HEAPU8, this.wasmBufferPtr);
+          this.wasmApi.scan_image_rgba(this.wasmBufferPtr, w, h);
+
+          if (this.detectedThisTick) {
+            break;
+          }
+        }
+      }
+
     } finally {
       this.hadDetectionLastTick = this.detectedThisTick;
-      // Hủy liên kết tham chiếu để GC thu dọn RAM sớm
       imageData = null;
+      fullImageData = null;
     }
   }
+
 
   // ── Drawing ─────────────────────────────────────────────────────
 
