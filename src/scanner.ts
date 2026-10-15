@@ -144,6 +144,8 @@ export class BarcodeScanner {
 
   // Runtime state
   private _isRunning = false;
+  private starting = false;
+  private lifecycle = 0;
   private video: HTMLVideoElement | null = null;
   private polyCanvas: HTMLCanvasElement | null = null;
   private polyCtx: CanvasRenderingContext2D | null = null;
@@ -211,23 +213,34 @@ export class BarcodeScanner {
   // ── Public lifecycle ────────────────────────────────────────────
 
   async start(): Promise<void> {
-    if (this._isRunning) return;
+    if (this._isRunning || this.starting) return;
+    const lifecycle = ++this.lifecycle;
+    this.starting = true;
 
     try {
       this.setupDOM();
       await this.loadWasm();
+      if (lifecycle !== this.lifecycle) return;
       await this.startCamera();
+      if (lifecycle !== this.lifecycle) return;
       this.setupResultHandler();
       this.startScanLoop();
       this._isRunning = true;
     } catch (err) {
+      // Closing/reopening the sheet invalidates old permission/play results.
+      // An old rejection must not tear down the new scanner or report an error.
+      if (lifecycle !== this.lifecycle) return;
       this.stop();
       const error = err instanceof Error ? err : new Error(String(err));
       this.onError(error);
+    } finally {
+      if (lifecycle === this.lifecycle) this.starting = false;
     }
   }
 
   stop(): void {
+    ++this.lifecycle;
+    this.starting = false;
     this.stopScanLoop();
     this.stopCamera();
     this.teardownDOM();
@@ -464,7 +477,9 @@ export class BarcodeScanner {
   // ── Camera ──────────────────────────────────────────────────────
 
   private async startCamera(): Promise<void> {
-    if (!this.video) throw new Error('DOM not set up');
+    const video = this.video;
+    const lifecycle = this.lifecycle;
+    if (!video) throw new Error('DOM not set up');
 
     // Sử dụng cấu hình camera tối ưu 1280x720 cho iOS để tránh bị mờ tiêu cự
     const constraints: MediaStreamConstraints = {
@@ -475,9 +490,16 @@ export class BarcodeScanner {
       } as MediaTrackConstraints,
     };
 
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    this.video.srcObject = this.stream;
-    await this.video.play();
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    if (lifecycle !== this.lifecycle || this.video !== video) {
+      // Permission may finish after stop() removed the video. Release the
+      // returned stream without attaching it or replacing a newer camera.
+      for (const track of stream.getTracks()) track.stop();
+      return;
+    }
+    this.stream = stream;
+    video.srcObject = stream;
+    await video.play();
   }
 
   private stopCamera(): void {
